@@ -39,6 +39,8 @@ pub struct Quote {
     pub minimum_amount: u64,
     pub maximum_amount: u64,
     pub valid_until: u64,
+    /// Schema version for this record. See [`SCHEMA_V1`].
+    pub schema_version: u32,
 }
 
 #[contracttype]
@@ -91,6 +93,8 @@ pub struct Attestation {
     pub timestamp: u64,
     pub payload_hash: Bytes,
     pub signature: Bytes,
+    /// Schema version for this record. See [`SCHEMA_V1`].
+    pub schema_version: u32,
 }
 
 #[contracttype]
@@ -317,6 +321,8 @@ pub struct KycRecord {
     pub reviewed_at: Option<u64>,
     pub expiry: Option<u64>,
     pub rejection_reason_hash: Option<Bytes>,
+    /// Schema version for this record. See [`SCHEMA_V1`].
+    pub schema_version: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +425,64 @@ pub struct CachedToml {
 }
 
 const MIN_TEMP_TTL: u32 = 15; // min_temp_entry_ttl - 1
+
+// ---------------------------------------------------------------------------
+// #244 — Contract-level cache configuration
+// ---------------------------------------------------------------------------
+
+/// Central cache TTL configuration stored in contract instance storage.
+///
+/// All cache operations read these values as defaults. Callers may still pass
+/// an explicit TTL override (non-zero) to `cache_metadata` / `cache_capabilities`
+/// / `fetch_anchor_info`; a zero override means "use the configured default".
+///
+/// Fields:
+/// - `metadata_ttl_seconds`     — primary TTL for anchor metadata entries.
+/// - `capabilities_ttl_seconds` — primary TTL for capabilities / stellar.toml entries.
+/// - `swr_ttl_seconds`          — stale-while-revalidate grace period appended after
+///                                the primary TTL before an entry is fully expired.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CacheConfig {
+    pub metadata_ttl_seconds: u64,
+    pub capabilities_ttl_seconds: u64,
+    pub swr_ttl_seconds: u64,
+}
+
+impl CacheConfig {
+    /// Sensible production defaults: 1 h metadata, 6 h capabilities, 5 min SWR.
+    pub fn default_config() -> Self {
+        CacheConfig {
+            metadata_ttl_seconds: 3_600,
+            capabilities_ttl_seconds: 21_600,
+            swr_ttl_seconds: 300,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #247 — on-chain schema versioning
+//
+// Each persistent contract type carries a `schema_version: u32` field.
+// The version is bumped only when the serialized shape changes in a way that
+// is incompatible with old stored values (e.g. a field is added or removed).
+//
+// Version history:
+//   SCHEMA_V1 = 1  — initial versioned layout (introduced in this release)
+//
+// Migration strategy:
+//   After a WASM upgrade that increments a schema version, call `migrate()`
+//   as admin. The migrate function reads entries with the old schema version
+//   and rewrites them with the new one.  Because Soroban XDR decoding is
+//   strict, old unversioned values (implicitly "V0") will fail to decode into
+//   the new type; the migration must handle that by catching panics or by
+//   storing a versioned wrapper enum around the concrete type.
+// ---------------------------------------------------------------------------
+
+/// Schema version written into every new [`Attestation`], [`Quote`], and
+/// [`KycRecord`].  Consumers should compare against this constant when reading
+/// stored data to detect version skew.
+pub const SCHEMA_V1: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Event structs
@@ -606,6 +670,45 @@ fn anchor_meta_opt(env: &Env, anchor: &Address) -> Option<RoutingAnchorMeta> {
 }
 
 // ---------------------------------------------------------------------------
+// #245 — fee and limit validation helpers
+//
+// These are free functions (not contract methods) so they can be called from
+// multiple contract entry-points without requiring `Self`.
+// ---------------------------------------------------------------------------
+
+/// Panic with [`ErrorCode::InvalidQuote`] when `fee` exceeds 100 % (10 000 bps).
+fn validate_fee_percent(env: &Env, fee: u32) {
+    if fee > 10_000 {
+        panic_with_error!(env, ErrorCode::InvalidQuote);
+    }
+}
+
+/// Panic with [`ErrorCode::InvalidQuote`] when `max_amount` is non-zero and
+/// less than `min_amount` (inverted limit range).
+fn validate_amount_limits(env: &Env, min_amount: u64, max_amount: u64) {
+    if max_amount != 0 && min_amount > max_amount {
+        panic_with_error!(env, ErrorCode::InvalidQuote);
+    }
+}
+
+/// Panic with [`ErrorCode::ValidationError`] when `code` is empty or longer
+/// than 12 characters (the Stellar maximum asset-code length).
+fn validate_currency_code(env: &Env, code: &String) {
+    if code.len() == 0 || code.len() > 12 {
+        panic_with_error!(env, ErrorCode::ValidationError);
+    }
+}
+
+/// Validate all fee and limit fields of a single [`AssetInfo`] record.
+fn validate_asset_info(env: &Env, asset: &AssetInfo) {
+    validate_currency_code(env, &asset.code);
+    validate_fee_percent(env, asset.deposit_fee_percent);
+    validate_fee_percent(env, asset.withdrawal_fee_percent);
+    validate_amount_limits(env, asset.deposit_min_amount, asset.deposit_max_amount);
+    validate_amount_limits(env, asset.withdrawal_min_amount, asset.withdrawal_max_amount);
+}
+
+// ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
 
@@ -730,6 +833,43 @@ impl AnchorKitContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+    }
+
+    /// Return the current data-schema version written into every new record.
+    ///
+    /// Consumers can compare the value returned by stored records against this
+    /// constant to detect version skew after a WASM upgrade.
+    pub fn get_schema_version(_env: Env) -> u32 {
+        SCHEMA_V1
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache configuration (#244)
+    // -----------------------------------------------------------------------
+
+    fn cache_config_key(env: &Env) -> soroban_sdk::Vec<soroban_sdk::Symbol> {
+        soroban_sdk::vec![env, symbol_short!("CACHCFG")]
+    }
+
+    /// Store a new [`CacheConfig`] in instance storage. Admin-only.
+    pub fn set_cache_config(env: Env, config: CacheConfig) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&Self::cache_config_key(&env), &config);
+        env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+    }
+
+    /// Return the active [`CacheConfig`], falling back to [`CacheConfig::default_config`].
+    pub fn get_cache_config(env: Env) -> CacheConfig {
+        env.storage()
+            .instance()
+            .get::<_, CacheConfig>(&Self::cache_config_key(&env))
+            .unwrap_or_else(CacheConfig::default_config)
+    }
+
+    /// Resolve the effective TTL: use `override_ttl` when non-zero, otherwise
+    /// fall back to `configured`.
+    fn effective_ttl(override_ttl: u64, configured: u64) -> u64 {
+        if override_ttl != 0 { override_ttl } else { configured }
     }
 
     // -----------------------------------------------------------------------
@@ -1646,6 +1786,7 @@ impl AnchorKitContract {
             subject: subject.clone(), status: KycStatus::Pending as u32,
             submitted_at: now, reviewed_at: None, expiry: None,
             rejection_reason_hash: None,
+            schema_version: SCHEMA_V1,
         };
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
@@ -1861,9 +2002,8 @@ impl AnchorKitContract {
         valid_until: u64,
     ) -> u64 {
         anchor.require_auth();
-        if fee_percentage > 10_000 {
-            panic_with_error!(&env, ErrorCode::InvalidQuote);
-        }
+        validate_fee_percent(&env, fee_percentage);
+        validate_amount_limits(&env, minimum_amount, maximum_amount);
         let inst = env.storage().instance();
         let qcnt_key = make_storage_key(&env, &[b"QCNT"]);
         let next: u64 = inst.get(&qcnt_key).unwrap_or(0u64) + 1;
@@ -2165,15 +2305,17 @@ impl AnchorKitContract {
     pub fn cache_metadata(env: Env, anchor: Address, metadata: AnchorMetadata, ttl_seconds: u64) {
         Self::require_admin(&env);
         let now = env.ledger().timestamp();
+        let cfg = Self::get_cache_config(env.clone());
+        let ttl = Self::effective_ttl(ttl_seconds, cfg.metadata_ttl_seconds);
         let entry = MetadataCache {
             metadata,
             cached_at: now,
-            ttl_seconds,
+            ttl_seconds: ttl,
             stale_ttl_seconds: 0,
             needs_refresh: false,
         };
         let key = (symbol_short!("METACACHE"), anchor);
-        let ledger_ttl = if ttl_seconds as u32 > MIN_TEMP_TTL { ttl_seconds as u32 } else { MIN_TEMP_TTL };
+        let ledger_ttl = if ttl as u32 > MIN_TEMP_TTL { ttl as u32 } else { MIN_TEMP_TTL };
         env.storage().temporary().set(&key, &entry);
         env.storage().temporary().extend_ttl(&key, ledger_ttl, ledger_ttl);
     }
@@ -2207,15 +2349,18 @@ impl AnchorKitContract {
     ) {
         Self::require_admin(&env);
         let now = env.ledger().timestamp();
+        let cfg = Self::get_cache_config(env.clone());
+        let ttl = Self::effective_ttl(ttl_seconds, cfg.metadata_ttl_seconds);
+        let stale = Self::effective_ttl(stale_ttl_seconds, cfg.swr_ttl_seconds);
         let entry = MetadataCache {
             metadata,
             cached_at: now,
-            ttl_seconds,
-            stale_ttl_seconds,
+            ttl_seconds: ttl,
+            stale_ttl_seconds: stale,
             needs_refresh: false,
         };
         let key = (symbol_short!("METACACHE"), anchor);
-        let total_ttl = ttl_seconds.saturating_add(stale_ttl_seconds);
+        let total_ttl = ttl.saturating_add(stale);
         let ledger_ttl = if total_ttl as u32 > MIN_TEMP_TTL { total_ttl as u32 } else { MIN_TEMP_TTL };
         env.storage().temporary().set(&key, &entry);
         env.storage().temporary().extend_ttl(&key, ledger_ttl, ledger_ttl);
@@ -2258,15 +2403,18 @@ impl AnchorKitContract {
     ) {
         Self::require_admin(&env);
         let now = env.ledger().timestamp();
+        let cfg = Self::get_cache_config(env.clone());
+        let ttl = Self::effective_ttl(ttl_seconds, cfg.metadata_ttl_seconds);
+        let stale = Self::effective_ttl(stale_ttl_seconds, cfg.swr_ttl_seconds);
         let entry = MetadataCache {
             metadata,
             cached_at: now,
-            ttl_seconds,
-            stale_ttl_seconds,
+            ttl_seconds: ttl,
+            stale_ttl_seconds: stale,
             needs_refresh: false,
         };
         let key = (symbol_short!("METACACHE"), anchor);
-        let total_ttl = ttl_seconds.saturating_add(stale_ttl_seconds);
+        let total_ttl = ttl.saturating_add(stale);
         let ledger_ttl = if total_ttl as u32 > MIN_TEMP_TTL { total_ttl as u32 } else { MIN_TEMP_TTL };
         env.storage().temporary().set(&key, &entry);
         env.storage().temporary().extend_ttl(&key, ledger_ttl, ledger_ttl);
@@ -2361,9 +2509,11 @@ impl AnchorKitContract {
     pub fn cache_capabilities(env: Env, anchor: Address, toml_url: String, capabilities: String, ttl_seconds: u64) {
         Self::require_admin(&env);
         let now = env.ledger().timestamp();
-        let entry = CapabilitiesCache { toml_url, capabilities, cached_at: now, ttl_seconds };
+        let cfg = Self::get_cache_config(env.clone());
+        let ttl = Self::effective_ttl(ttl_seconds, cfg.capabilities_ttl_seconds);
+        let entry = CapabilitiesCache { toml_url, capabilities, cached_at: now, ttl_seconds: ttl };
         let key = (symbol_short!("CAPCACHE"), anchor);
-        let ledger_ttl = if ttl_seconds as u32 > MIN_TEMP_TTL { ttl_seconds as u32 } else { MIN_TEMP_TTL };
+        let ledger_ttl = if ttl as u32 > MIN_TEMP_TTL { ttl as u32 } else { MIN_TEMP_TTL };
         env.storage().temporary().set(&key, &entry);
         env.storage().temporary().extend_ttl(&key, ledger_ttl, ledger_ttl);
     }
@@ -2751,14 +2901,19 @@ impl AnchorKitContract {
         ttl_seconds: u64,
     ) {
         anchor.require_auth();
+        for asset in toml_data.currencies.iter() {
+            validate_asset_info(&env, &asset);
+        }
         let now = env.ledger().timestamp();
+        let cfg = Self::get_cache_config(env.clone());
+        let ttl = Self::effective_ttl(ttl_seconds, cfg.capabilities_ttl_seconds);
         let cached = CachedToml {
             toml: toml_data,
             cached_at: now,
-            ttl_seconds,
+            ttl_seconds: ttl,
         };
         let key = (symbol_short!("TOMLCACHE"), anchor);
-        let ledger_ttl = if ttl_seconds as u32 > MIN_TEMP_TTL { ttl_seconds as u32 } else { MIN_TEMP_TTL };
+        let ledger_ttl = if ttl as u32 > MIN_TEMP_TTL { ttl as u32 } else { MIN_TEMP_TTL };
         env.storage().temporary().set(&key, &cached);
         env.storage().temporary().extend_ttl(&key, ledger_ttl, ledger_ttl);
     }
