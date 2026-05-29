@@ -1,3 +1,10 @@
+#![cfg(feature = "std")]
+//! CLI binary for AnchorKit.
+//!
+//! This binary is only available when building with the `std` feature (the default).
+//! For WASM builds, disable default features:
+//!   cargo build --target wasm32-unknown-unknown --no-default-features --features wasm
+
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 

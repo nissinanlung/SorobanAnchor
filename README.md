@@ -51,6 +51,27 @@ For WASM output (Soroban deployment):
 cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm
 ```
 
+### Build Matrix
+
+SorobanAnchor supports two distinct build environments with complete feature separation:
+
+| Configuration | Command | Target | Output | CLI |
+|---|---|---|---|---|
+| **Native (default)** | `cargo build --release` | `x86_64-unknown-linux-gnu` | `target/release/anchorkit` | ✓ Yes |
+| **WASM/Soroban** | `cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm` | `wasm32-unknown-unknown` | `target/wasm32-unknown-unknown/release/anchorkit.wasm` | ✗ No |
+
+**Key differences:**
+- **Native**: Includes CLI, HTTP client (`reqwest`), filesystem access, and credential storage
+- **WASM**: Minimal runtime, no std library, only smart contract code for Soroban
+
+Both builds are verified by the automated test suite:
+
+```bash
+./scripts/test_build_matrix.sh
+```
+
+For detailed information about build paths, features, and environment separation, see [docs/build-matrix.md](docs/build-matrix.md).
+
 ## Testing
 
 ```bash
