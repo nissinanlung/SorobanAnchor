@@ -302,6 +302,46 @@ pub struct RecoveryMetadata {
     pub retry_count: u32,
 }
 
+/// Soroban-compatible optional wrapper for [`RecoveryMetadata`].
+///
+/// `Option<RecoveryMetadata>` cannot be used directly in `#[contracttype]`
+/// structs because Soroban's XDR layer does not automatically derive
+/// `IntoVal`/`TryFromVal` for `Option<UserDefinedType>`. This enum is the
+/// on-chain equivalent of `Option<RecoveryMetadata>` and provides the same
+/// ergonomic API via inherent methods.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OptRecovery {
+    None,
+    Some(RecoveryMetadata),
+}
+
+impl OptRecovery {
+    pub fn is_some(&self) -> bool { matches!(self, OptRecovery::Some(_)) }
+    pub fn is_none(&self) -> bool { matches!(self, OptRecovery::None) }
+
+    pub fn unwrap(self) -> RecoveryMetadata {
+        match self {
+            OptRecovery::Some(m) => m,
+            OptRecovery::None => panic!("called unwrap() on OptRecovery::None"),
+        }
+    }
+
+    pub fn as_mut(&mut self) -> Option<&mut RecoveryMetadata> {
+        match self {
+            OptRecovery::Some(m) => Some(m),
+            OptRecovery::None => None,
+        }
+    }
+
+    pub fn into_option(self) -> Option<RecoveryMetadata> {
+        match self {
+            OptRecovery::Some(m) => Some(m),
+            OptRecovery::None => None,
+        }
+    }
+}
+
 /// A snapshot of a tracked transaction's current state.
 ///
 /// Stored in Soroban persistent storage (production) or an in-memory cache
@@ -321,7 +361,7 @@ pub struct TransactionStateRecord {
     pub state_history: Vec<(TransactionState, u64)>,
     /// Recovery metadata, populated when the transaction enters the
     /// [`Failed`](TransactionState::Failed) state.
-    pub recovery_metadata: Option<RecoveryMetadata>,
+    pub recovery_metadata: OptRecovery,
 }
 
 /// Audit entry for a single transition attempt (success or failure).
@@ -445,7 +485,7 @@ impl TransactionStateTracker {
             last_updated_ledger: current_ledger,
             error_message: None,
             state_history: history,
-            recovery_metadata: None,
+            recovery_metadata: OptRecovery::None,
         };
 
         if self.is_dev_mode {
@@ -641,7 +681,7 @@ impl TransactionStateTracker {
                         let reason = error_message
                             .clone()
                             .unwrap_or_else(|| String::from_str(env, "unspecified failure"));
-                        record.recovery_metadata = Some(RecoveryMetadata {
+                        record.recovery_metadata = OptRecovery::Some(RecoveryMetadata {
                             failure_reason: reason,
                             last_updated_ledger: current_ledger,
                             failed_from_state: from_state,
@@ -704,7 +744,7 @@ impl TransactionStateTracker {
                 let reason = error_message
                     .clone()
                     .unwrap_or_else(|| String::from_str(env, "unspecified failure"));
-                record.recovery_metadata = Some(RecoveryMetadata {
+                record.recovery_metadata = OptRecovery::Some(RecoveryMetadata {
                     failure_reason: reason,
                     last_updated_ledger: current_ledger,
                     failed_from_state: from_state,
@@ -1004,7 +1044,7 @@ impl TransactionStateTracker {
         env: &Env,
     ) -> Result<Option<RecoveryMetadata>, String> {
         let record = self.get_transaction_state(transaction_id, env)?;
-        Ok(record.and_then(|r| r.recovery_metadata))
+        Ok(record.and_then(|r| r.recovery_metadata.into_option()))
     }
 
     /// Returns `true` when the transaction is in the [`Failed`](TransactionState::Failed)
